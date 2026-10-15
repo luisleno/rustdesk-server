@@ -33,7 +33,15 @@ jobs:
           tool: cross
 
       - name: Build hbbs and hbbr (musl)
-        run: cross build --release --all-features --target x86_64-unknown-linux-musl
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! cross build --release --all-features --target x86_64-unknown-linux-musl 2>&1 | tee build.log; then
+            # Erros viram anotações públicas (os logs exigem login).
+            grep -E "^(error|warning: unused)|^\s+--> " build.log | head -40 | while IFS= read -r l; do echo "::error::$l"; done
+            tail -25 build.log | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
 
       - name: Collect binaries
         run: |
