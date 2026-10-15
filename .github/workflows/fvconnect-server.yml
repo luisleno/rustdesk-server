@@ -1,0 +1,63 @@
+name: FvConnect - servidor
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/fvconnect-server
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build hbbs and hbbr (musl)
+        run: cross build --release --all-features --target x86_64-unknown-linux-musl
+
+      - name: Collect binaries
+        run: |
+          mkdir -p out
+          cp target/x86_64-unknown-linux-musl/release/hbbs target/x86_64-unknown-linux-musl/release/hbbr out/
+          chmod a+x out/*
+          cp docker-fvconnect/Dockerfile out/
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: fvconnect-server-linux-amd64
+          path: out/
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        run: |
+          IMAGE_LC=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          docker build -t "$IMAGE_LC:latest" -t "$IMAGE_LC:${GITHUB_SHA::7}" out/
+          docker push "$IMAGE_LC:latest"
+          docker push "$IMAGE_LC:${GITHUB_SHA::7}"

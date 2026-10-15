@@ -543,6 +543,17 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
+                    if let Err(message) = crate::fvconnect::authorize(&rf.token, &rf.id).await {
+                        log::info!("FvConnect: relay to {} refused from {}", rf.id, addr);
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_relay_response(RelayResponse {
+                            uuid: rf.uuid.clone(),
+                            refuse_reason: message,
+                            ..Default::default()
+                        });
+                        allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
+                        return true;
+                    }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
@@ -732,6 +743,16 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
+        if let Err(message) = crate::fvconnect::authorize(&ph.token, &ph.id).await {
+            log::info!("FvConnect: punch hole to {} refused from {}", ph.id, addr);
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                other_failure: message,
                 ..Default::default()
             });
             return Ok((msg_out, None));
