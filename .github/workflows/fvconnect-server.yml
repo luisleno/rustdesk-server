@@ -33,13 +33,15 @@ jobs:
       - name: Build hbbs and hbbr (musl)
         shell: bash
         run: |
-          set -o pipefail
-          if ! cargo build --release --target x86_64-unknown-linux-musl 2>&1 | tee build.log; then
+          set +e
+          cargo build --release --target x86_64-unknown-linux-musl > build.log 2>&1
+          code=$?
+          if [ $code -ne 0 ]; then
             # Erros viram anotações públicas (os logs exigem login).
-            grep -E "^error" -A6 build.log | head -60 | while IFS= read -r l; do echo "::error::${l}"; done
-            tail -15 build.log | while IFS= read -r l; do echo "::error::${l}"; done
-            exit 1
+            { grep -nE "error|panicked|failed" build.log | head -30; tail -n 30 build.log; } | sed 's/\[[0-9;]*m//g' | while IFS= read -r l; do echo "::error::${l}"; done
+            exit $code
           fi
+          tail -n 5 build.log
 
       - name: Collect binaries
         run: |
