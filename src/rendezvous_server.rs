@@ -543,7 +543,7 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    if let Err(message) = crate::fvconnect::authorize(&rf.token, &rf.id).await {
+                    if let Err(message) = crate::fvconnect::authorize(&rf.token, &rf.id, &crate::fvconnect::ip_of(&addr)).await {
                         log::info!("FvConnect: relay to {} refused from {}", rf.id, addr);
                         let mut msg_out = RendezvousMessage::new();
                         msg_out.set_relay_response(RelayResponse {
@@ -747,7 +747,7 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
-        if let Err(message) = crate::fvconnect::authorize(&ph.token, &ph.id).await {
+        if let Err(message) = crate::fvconnect::authorize(&ph.token, &ph.id, &crate::fvconnect::ip_of(&addr)).await {
             log::info!("FvConnect: punch hole to {} refused from {}", ph.id, addr);
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {

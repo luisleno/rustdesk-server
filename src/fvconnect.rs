@@ -1,8 +1,10 @@
 // FvConnect license gate.
 //
 // Before relaying a connection request (punch hole or relay), hbbs asks the FvConnect portal
-// whether the technician's login token may connect. The client already sends its account
-// access token in PunchHoleRequest.token / RequestRelay.token.
+// whether the technician's login token may connect. The client sends its account access
+// token in PunchHoleRequest.token / RequestRelay.token, or "fvanon:<machine uuid>" when it is
+// not logged in (free period, counted per installation by the portal). The requester's IP goes
+// along so the portal can limit how many new installations one network creates.
 //
 // Environment:
 //   FV_ENFORCE=Y      turns the gate on (off by default, so deploying this build changes nothing)
@@ -23,7 +25,7 @@ const DENY_TTL: Duration = Duration::from_secs(15);
 const STALE_ALLOW: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_CACHE: usize = 10_000;
 
-const MSG_NO_LOGIN: &str = "Entre na sua conta FvConnect (botão Conta) para acessar outros computadores.";
+const MSG_NO_LOGIN: &str = "[fv:signup] Entre na sua conta FvConnect (botão Conta) para acessar outros computadores.";
 const MSG_UNAVAILABLE: &str = "Não foi possível validar a licença FvConnect agora. Tente de novo em instantes.";
 
 struct Decision {
@@ -83,7 +85,18 @@ fn remember(token: &str, allow: bool, message: String) {
     );
 }
 
-async fn ask_portal(token: &str, target: &str) -> Result<(bool, String), String> {
+/// The requester's IP as text, with IPv4-mapped IPv6 addresses shown as plain IPv4.
+pub fn ip_of(addr: &std::net::SocketAddr) -> String {
+    match addr.ip() {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => v6.to_string(),
+        },
+        ip => ip.to_string(),
+    }
+}
+
+async fn ask_portal(token: &str, target: &str, ip: &str) -> Result<(bool, String), String> {
     let url = env("FV_PORTAL_URL");
     let key = env("FV_SERVER_KEY");
     if url.is_empty() || key.is_empty() {
@@ -93,7 +106,7 @@ async fn ask_portal(token: &str, target: &str) -> Result<(bool, String), String>
     let res = client
         .post(&url)
         .header("x-fv-server-key", key)
-        .json(&serde_json::json!({ "token": token, "target": target }))
+        .json(&serde_json::json!({ "token": token, "target": target, "ip": ip }))
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -108,7 +121,7 @@ async fn ask_portal(token: &str, target: &str) -> Result<(bool, String), String>
 
 /// Ok(()) lets the connection through; Err(message) refuses it and the message is shown
 /// to the technician.
-pub async fn authorize(token: &str, target: &str) -> Result<(), String> {
+pub async fn authorize(token: &str, target: &str, ip: &str) -> Result<(), String> {
     if !enforced() {
         return Ok(());
     }
@@ -118,7 +131,7 @@ pub async fn authorize(token: &str, target: &str) -> Result<(), String> {
     if let Some(r) = cached(token, ALLOW_TTL) {
         return r;
     }
-    match ask_portal(token, target).await {
+    match ask_portal(token, target, ip).await {
         Ok((allow, message)) => {
             remember(token, allow, message.clone());
             if allow {
