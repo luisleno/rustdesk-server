@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::FramedStream,
+    tcp::{Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -52,6 +52,8 @@ type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
     TcpStream(TcpStreamSink),
+    // FvConnect: TCP connection that completed the key exchange; everything sent is encrypted.
+    SecureTcp(TcpStreamSink, Encrypt),
     Ws(WsSink),
 }
 type Sender = mpsc::UnboundedSender<Data>;
@@ -887,6 +889,9 @@ impl RendezvousServer {
                     Sink::TcpStream(s) => {
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
+                    Sink::SecureTcp(s, enc) => {
+                        allow_err!(s.send(Bytes::from(enc.enc(&bytes))).await);
+                    }
                     Sink::Ws(ws) => {
                         allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
                     }
@@ -1249,7 +1254,48 @@ impl RendezvousServer {
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            // FvConnect: offer the key exchange first. Clients that send a login/license token
+            // answer it and the rest of the connection is encrypted (the token never travels in
+            // the clear); clients that do not need it skip the offer and talk in plain text.
+            let mut kx: Option<box_::SecretKey> = None;
+            let mut dec: Option<Encrypt> = None;
+            if let Some(sk) = self.inner.sk.as_ref() {
+                let (our_pk_b, our_sk_b) = box_::gen_keypair();
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_key_exchange(KeyExchange {
+                    keys: vec![sign::sign(&our_pk_b.0, sk).into()],
+                    ..Default::default()
+                });
+                Self::send_to_sink(&mut sink, msg_out).await;
+                kx = Some(our_sk_b);
+            }
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                if let Some(d) = dec.as_mut() {
+                    if d.dec(&mut bytes).is_err() {
+                        log::warn!("FvConnect: decryption error from {}", addr);
+                        break;
+                    }
+                } else if let Some(our_sk_b) = kx.take() {
+                    if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
+                        if let Some(rendezvous_message::Union::KeyExchange(ex)) = msg_in.union {
+                            if ex.keys.len() != 2 {
+                                break;
+                            }
+                            let key = match Encrypt::decode(&ex.keys[1], &ex.keys[0], &our_sk_b) {
+                                Ok(key) => key,
+                                Err(e) => {
+                                    log::warn!("FvConnect: key exchange failed from {}: {}", addr, e);
+                                    break;
+                                }
+                            };
+                            if let Some(Sink::TcpStream(a)) = sink.take() {
+                                sink = Some(Sink::SecureTcp(a, Encrypt::new(key.clone())));
+                            }
+                            dec = Some(Encrypt::new(key));
+                            continue;
+                        }
+                    }
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
