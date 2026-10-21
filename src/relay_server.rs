@@ -25,7 +25,7 @@ use std::{
     io::prelude::*,
     io::Error,
     net::{IpAddr, SocketAddr},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 type Usage = (usize, usize, usize, usize);
@@ -35,6 +35,68 @@ lazy_static::lazy_static! {
     static ref USAGE: RwLock<HashMap<String, Usage>> = Default::default();
     static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
+}
+
+// FvConnect: relay sessions in progress and bytes relayed, reported to the portal (monitoring).
+static FV_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static FV_BYTES: AtomicU64 = AtomicU64::new(0);
+
+struct FvActiveGuard;
+impl FvActiveGuard {
+    fn new() -> Self {
+        FV_ACTIVE.fetch_add(1, Ordering::SeqCst);
+        FvActiveGuard
+    }
+}
+impl Drop for FvActiveGuard {
+    fn drop(&mut self) {
+        FV_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Every minute, POST { kind: "relay", active, bytes } to the portal. The URL comes from
+/// FV_STATS_URL, or FV_PORTAL_URL with "/authorize" replaced by "/server-stats".
+fn fv_start_stats_reporter() {
+    let env = |n: &str| std::env::var(n).unwrap_or_default().trim().to_owned();
+    let key = env("FV_SERVER_KEY");
+    let mut url = env("FV_STATS_URL");
+    if url.is_empty() {
+        url = env("FV_PORTAL_URL").replace("/authorize", "/server-stats");
+    }
+    if url.is_empty() || key.is_empty() {
+        log::info!("FvConnect stats: FV_PORTAL_URL/FV_SERVER_KEY not set, not reporting");
+        return;
+    }
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("FvConnect stats: http client: {}", e);
+                return;
+            }
+        };
+        let mut tick = interval(Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            let bytes = FV_BYTES.swap(0, Ordering::SeqCst);
+            let body = serde_json::json!({
+                "kind": "relay",
+                "active": FV_ACTIVE.load(Ordering::SeqCst),
+                "bytes": bytes,
+            });
+            match client.post(&url).header("x-fv-server-key", &key).json(&body).send().await {
+                Ok(r) if r.status().is_success() => {}
+                Ok(r) => {
+                    log::warn!("FvConnect stats: portal answered {}", r.status());
+                    FV_BYTES.fetch_add(bytes, Ordering::SeqCst);
+                }
+                Err(e) => {
+                    log::warn!("FvConnect stats: {}", e);
+                    FV_BYTES.fetch_add(bytes, Ordering::SeqCst);
+                }
+            }
+        }
+    });
 }
 
 static DOWNGRADE_THRESHOLD_100: AtomicUsize = AtomicUsize::new(66); // 0.66
@@ -82,6 +144,7 @@ pub async fn start_with_bind(
         BLOCKLIST_FILE,
         BLOCKLIST.read().await.len()
     );
+    fv_start_stats_reporter();
     let port: u16 = port.parse()?;
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
@@ -519,6 +582,7 @@ async fn relay(
         (sb * DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst) as f64 / 100. / 1000.) as usize; // in bit/ms
     let mut timer = interval(Duration::from_secs(3));
     let mut last_recv_time = std::time::Instant::now();
+    let _fv_active = FvActiveGuard::new();
     loop {
         tokio::select! {
             res = peer.recv() => {
@@ -533,6 +597,7 @@ async fn relay(
                     total_limiter.consume(nb).await;
                     total += nb;
                     total_s += nb;
+                    FV_BYTES.fetch_add(bytes.len() as u64, Ordering::SeqCst);
                     if !bytes.is_empty() {
                         stream.send_raw(bytes.into()).await?;
                     }
@@ -552,6 +617,7 @@ async fn relay(
                     total_limiter.consume(nb).await;
                     total += nb;
                     total_s += nb;
+                    FV_BYTES.fetch_add(bytes.len() as u64, Ordering::SeqCst);
                     if !bytes.is_empty() {
                         peer.send_raw(bytes.into()).await?;
                     }
