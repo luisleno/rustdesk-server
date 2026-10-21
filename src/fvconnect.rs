@@ -32,6 +32,9 @@ struct Decision {
     allow: bool,
     message: String,
     at: Instant,
+    // How long an "allow" may be reused without asking the portal again. The portal answers
+    // { cache: 0 } when a concurrent-session limit applies, so every new connection is checked.
+    ttl: Duration,
 }
 
 static CACHE: Lazy<Mutex<HashMap<String, Decision>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -54,20 +57,22 @@ pub fn enforced() -> bool {
     matches!(env("FV_ENFORCE").as_str(), "Y" | "y" | "1" | "true")
 }
 
-fn cached(token: &str, max_age_allow: Duration) -> Option<Result<(), String>> {
+/// `stale`: the portal is unreachable, so an allow up to STALE_ALLOW old still counts.
+fn cached(token: &str, stale: bool) -> Option<Result<(), String>> {
     let cache = CACHE.lock().unwrap();
     let d = cache.get(token)?;
     let age = d.at.elapsed();
+    let max_age_allow = if stale { STALE_ALLOW } else { d.ttl };
     if d.allow && age < max_age_allow {
         Some(Ok(()))
-    } else if !d.allow && age < DENY_TTL {
+    } else if !d.allow && age < d.ttl.min(DENY_TTL) {
         Some(Err(d.message.clone()))
     } else {
         None
     }
 }
 
-fn remember(token: &str, allow: bool, message: String) {
+fn remember(token: &str, allow: bool, message: String, ttl: Duration) {
     let mut cache = CACHE.lock().unwrap();
     if cache.len() >= MAX_CACHE {
         cache.retain(|_, d| d.at.elapsed() < STALE_ALLOW);
@@ -81,6 +86,7 @@ fn remember(token: &str, allow: bool, message: String) {
             allow,
             message,
             at: Instant::now(),
+            ttl,
         },
     );
 }
@@ -96,7 +102,7 @@ pub fn ip_of(addr: &std::net::SocketAddr) -> String {
     }
 }
 
-async fn ask_portal(token: &str, target: &str, ip: &str) -> Result<(bool, String), String> {
+async fn ask_portal(token: &str, target: &str, ip: &str) -> Result<(bool, String, Duration), String> {
     let url = env("FV_PORTAL_URL");
     let key = env("FV_SERVER_KEY");
     if url.is_empty() || key.is_empty() {
@@ -116,7 +122,8 @@ async fn ask_portal(token: &str, target: &str, ip: &str) -> Result<(bool, String
     let v: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
     let allow = v["allow"].as_bool().unwrap_or(false);
     let message = v["message"].as_str().unwrap_or("Acesso não autorizado.").to_owned();
-    Ok((allow, message))
+    let ttl = v["cache"].as_u64().map(Duration::from_secs).unwrap_or(ALLOW_TTL).min(ALLOW_TTL);
+    Ok((allow, message, ttl))
 }
 
 /// Ok(()) lets the connection through; Err(message) refuses it and the message is shown
@@ -128,12 +135,12 @@ pub async fn authorize(token: &str, target: &str, ip: &str) -> Result<(), String
     if token.is_empty() {
         return Err(MSG_NO_LOGIN.to_owned());
     }
-    if let Some(r) = cached(token, ALLOW_TTL) {
+    if let Some(r) = cached(token, false) {
         return r;
     }
     match ask_portal(token, target, ip).await {
-        Ok((allow, message)) => {
-            remember(token, allow, message.clone());
+        Ok((allow, message, ttl)) => {
+            remember(token, allow, message.clone(), ttl);
             if allow {
                 Ok(())
             } else {
@@ -142,7 +149,7 @@ pub async fn authorize(token: &str, target: &str, ip: &str) -> Result<(), String
         }
         Err(e) => {
             log::warn!("FvConnect: license check failed for {}: {}", target, e);
-            match cached(token, STALE_ALLOW) {
+            match cached(token, true) {
                 Some(Ok(())) => Ok(()),
                 _ => Err(MSG_UNAVAILABLE.to_owned()),
             }
